@@ -113,7 +113,7 @@ import wave
 import signal
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response,Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 from io import BytesIO
@@ -121,6 +121,7 @@ from tools.i18n.i18n import I18nAuto
 from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
 from GPT_SoVITS.TTS_infer_pack.text_segmentation_method import get_method_names as get_cut_method_names
 from pydantic import BaseModel
+from urllib.parse import unquote
 
 # print(sys.path)
 i18n = I18nAuto()
@@ -146,6 +147,20 @@ tts_pipeline = TTS(tts_config)
 
 APP = FastAPI()
 
+SPEAKERS=[
+    {
+        "name":"曼波",
+        "gender":"女",
+        "speaker":"BV1",
+
+        "ref_audio_path":"voice/曼波参考音频.wav",
+        "prompt_text":"点击文本选项，再点击对应的文本素材，选择文本朗读找到曼波音色即可",
+        "prompt_lang":"zh",
+        "text_lang":"zh"
+    }
+]
+
+SPEAKERS_MAP={s["speaker"]:s for s in SPEAKERS}
 
 class TTS_Request(BaseModel):
     text: str = None
@@ -220,6 +235,68 @@ def pack_aac(io_buffer: BytesIO, data: np.ndarray, rate: int):
     return io_buffer
 
 
+def pack_mp3(io_buffer: BytesIO, data: np.ndarray, rate: int):
+    """
+    将 PCM 数据编码为 MP3 写入 io_buffer 并返回。
+    要求:
+        - data 为单声道 PCM
+        - data 最终按 int16 (s16le) 传给 ffmpeg
+    """
+    # 保证是一维单声道
+    if data.ndim > 1:
+        data = data[:, 0]
+
+    # 转为 int16 (ffmpeg 这边配置的是 s16le)
+    if data.dtype != np.int16:
+        # 如果是 float [-1, 1] 之类的，先缩放再转换会更合理
+        if np.issubdtype(data.dtype, np.floating):
+            data = np.clip(data, -1.0, 1.0)
+            data = (data * 32767).astype(np.int16)
+        else:
+            data = data.astype(np.int16)
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",    # 只输出错误，方便调试
+        "-f", "s16le",           # 输入格式：16位小端 PCM
+        "-ar", str(rate),        # 采样率
+        "-ac", "1",              # 单声道
+        "-i", "pipe:0",          # 从 stdin 读
+        "-acodec", "libmp3lame", # MP3 编码器
+        "-b:a", "192k",          # 比特率
+        "-vn",                   # 无视频
+        "-f", "mp3",             # 输出格式：mp3
+        "pipe:1",                # 输出到 stdout
+    ]
+
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    out, err = process.communicate(input=data.tobytes())
+
+    # 检查 ffmpeg 是否出错
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg 编码失败（返回码 {process.returncode}）：\n{err.decode('utf-8', errors='ignore')}"
+        )
+
+    if not out:
+        # 正常情况下这里不会为空，给一个额外的提示
+        raise RuntimeError(
+            f"ffmpeg 没有产生任何输出，stderr:\n{err.decode('utf-8', errors='ignore')}"
+        )
+
+    io_buffer.write(out)
+    # 很关键：如果后面要 read()，需要把指针挪回开头
+    io_buffer.seek(0)
+    return io_buffer
+
+
 def pack_audio(io_buffer: BytesIO, data: np.ndarray, rate: int, media_type: str):
     if media_type == "ogg":
         io_buffer = pack_ogg(io_buffer, data, rate)
@@ -227,6 +304,8 @@ def pack_audio(io_buffer: BytesIO, data: np.ndarray, rate: int, media_type: str)
         io_buffer = pack_aac(io_buffer, data, rate)
     elif media_type == "wav":
         io_buffer = pack_wav(io_buffer, data, rate)
+    elif media_type == "mp3":
+        io_buffer = pack_mp3(io_buffer, data, rate)
     else:
         io_buffer = pack_raw(io_buffer, data, rate)
     io_buffer.seek(0)
@@ -284,7 +363,7 @@ def check_params(req: dict):
             status_code=400,
             content={"message": f"prompt_lang: {prompt_lang} is not supported in version {tts_config.version}"},
         )
-    if media_type not in ["wav", "raw", "ogg", "aac"]:
+    if media_type not in ["wav", "raw", "ogg", "aac","mp3"]:
         return JSONResponse(status_code=400, content={"message": f"media_type: {media_type} is not supported"})
     elif media_type == "ogg" and not streaming_mode:
         return JSONResponse(status_code=400, content={"message": "ogg format is not supported in non-streaming mode"})
@@ -398,7 +477,7 @@ async def tts_get_endpoint(
     speed_factor: float = 1.0,
     fragment_interval: float = 0.3,
     seed: int = -1,
-    media_type: str = "wav",
+    media_type: str = "mp3",
     streaming_mode: bool = False,
     parallel_infer: bool = True,
     repetition_penalty: float = 1.35,
@@ -487,6 +566,62 @@ async def set_sovits_weights(weights_path: str = None):
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": "change sovits weight failed", "Exception": str(e)})
     return JSONResponse(status_code=200, content={"message": "success"})
+
+@APP.get("/api/speakers")
+async def get_speakers():
+    return [
+        {
+            "name":s["name"],
+            "gender":s["gender"],
+            "speaker":s["speaker"],
+        } for s in SPEAKERS
+    ]
+#为什么这里可以不是括号
+@APP.get("/api/tts.mp3")
+async def tts_mp3_endpoint(request:Request,text:str | None=None,speaker:str|None =None):
+    if text is None:
+        raw_query = request.url.query
+        if "+text=" in raw_query:
+            before,after= raw_query.split("+text=",1)
+            if "speaker=" in before and not speaker:
+                speaker= before.split("speaker=",1)[1]
+            text=unquote(after)
+    if not text:
+        return JSONResponse(status_code=400,content={"message":"text is required"})
+    cfg = None
+    if speaker:
+        cfg = SPEAKERS_MAP.get(speaker)
+    
+    if cfg is None:
+        cfg=SPEAKERS[0]
+
+
+    req = {
+        "text": text,
+        "text_lang": cfg["text_lang"].lower(),
+        "ref_audio_path": cfg["ref_audio_path"],
+        "aux_ref_audio_paths": None,
+        "prompt_text": cfg["prompt_text"],
+        "prompt_lang": cfg["prompt_lang"].lower(),
+        "top_k": int(5),
+        "top_p": float(1.0),
+        "temperature": float(1.0),
+        "text_split_method": "cut0",
+        "batch_size": int(1),
+        "batch_threshold": float(0.75),
+        "speed_factor": float(1.0),
+        "split_bucket": True,
+        "fragment_interval": float(0.3),
+        "seed": int(-1),
+        "media_type": "mp3",
+        "streaming_mode": True,
+        "parallel_infer": True,
+        "repetition_penalty": float(1.35),
+        "sample_steps": int(32),
+        "super_sampling": False,
+    }
+    return await tts_handle(req)
+
 
 
 if __name__ == "__main__":

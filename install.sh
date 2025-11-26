@@ -1,4 +1,7 @@
 #!/bin/bash
+set -x
+eval "$(conda shell.bash hook)"
+export PYTHONUNBUFFERED=1
 
 # cd into GPT-SoVITS Base Path
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -32,12 +35,15 @@ on_error() {
 }
 
 run_conda_quiet() {
-    local output
-    output=$(conda install --yes --quiet -c conda-forge "$@" 2>&1) || {
-        echo -e "${ERROR} Conda install failed:\n$output"
-        exit 1
-    }
+    if command -v mamba &>/dev/null; then
+        echo -e "${INFO}Using mamba to install: $@"
+        mamba install --yes -c conda-forge "$@"
+    else
+        echo -e "${WARNING}mamba not found, falling back to conda..."
+        conda install --yes -c conda-forge "$@"
+    fi
 }
+
 
 run_pip_quiet() {
     local output
